@@ -4,6 +4,7 @@ import io
 import json
 import mimetypes
 import sys
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Literal
@@ -235,8 +236,55 @@ IMAGE_REGIONS = {
     "full": (0.05, 0.22, 0.90, 0.72),   # under a normal title
     "left": (0.05, 0.22, 0.43, 0.72),   # left column
     "right": (0.52, 0.22, 0.43, 0.72),  # right column
-    "slide": (0.02, 0.17, 0.96, 0.81),  # as big as possible under a one-line title
-}
+    "slide": (0.02, 0.17, 0.96, 0.75),  # as big as possible under a one-line title,
+}                                       # leaving room for the sources footer
+FOOTER_PREFIX = "footer_"  # object ids of source footers (style_deck keeps their colour)
+FOOTER_COLOR = "#9E9E9E"
+
+
+def source_label(url: str) -> tuple[str, bool]:
+    """Short label for a source URL, and whether it is a Wikipedia article."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc.endswith("wikipedia.org") and parsed.path.startswith("/wiki/"):
+        return urllib.parse.unquote(parsed.path[6:]).replace("_", " "), True
+    return parsed.netloc.removeprefix("www.") or url, False
+
+
+def footer_requests(slide_id: str, urls: list[str], W: float, H: float) -> list[dict]:
+    """Requests for a small grey footer listing `urls` as clickable labels:
+    "Wikipedia: A · B" when all are Wikipedia articles, else "Sources: A · B (Wikipedia)"."""
+    labels = [source_label(u) for u in urls]
+    all_wiki = all(is_wiki for _, is_wiki in labels)
+    names = [name if all_wiki or not is_wiki else f"{name} (Wikipedia)" for name, is_wiki in labels]
+    prefix = "Wikipedia: " if all_wiki else "Sources: "
+    text = prefix + " · ".join(names)
+    fid = f"{FOOTER_PREFIX}{uuid.uuid4().hex}"
+    grey = {"opaqueColor": {"rgbColor": rgb(FOOTER_COLOR)}}
+    reqs = [{"createShape": {"objectId": fid, "shapeType": "TEXT_BOX", "elementProperties": {
+                "pageObjectId": slide_id,
+                "size": {"width": {"magnitude": 0.90 * W, "unit": "PT"},
+                         "height": {"magnitude": 0.06 * H, "unit": "PT"}},
+                "transform": {"scaleX": 1, "scaleY": 1, "translateX": 0.05 * W,
+                              "translateY": 0.93 * H, "unit": "PT"}}}},
+            {"insertText": {"objectId": fid, "text": text}},
+            {"updateTextStyle": {"objectId": fid, "textRange": {"type": "ALL"},
+                                 "fields": "fontSize,foregroundColor",
+                                 "style": {"fontSize": {"magnitude": 9, "unit": "PT"},
+                                           "foregroundColor": grey}}}]
+    pos = u16(prefix)
+    for url, name in zip(urls, names):
+        # Setting a link also applies the theme's link colour unless colour is set too.
+        reqs.append({"updateTextStyle": {
+            "objectId": fid, "fields": "link,foregroundColor,underline",
+            "style": {"link": {"url": url}, "foregroundColor": grey, "underline": True},
+            "textRange": {"type": "FIXED_RANGE", "startIndex": pos, "endIndex": pos + u16(name)}}})
+        pos += u16(name) + u16(" · ")
+    return reqs
+
+
+def page_size_pt(file_id: str) -> tuple[float, float]:
+    p = slides_api().get(presentationId=file_id, fields="pageSize").execute()["pageSize"]
+    return p["width"]["magnitude"] / EMU_PER_PT, p["height"]["magnitude"] / EMU_PER_PT
 
 
 def slides_api():
@@ -375,13 +423,14 @@ def fill_requests(page: dict, layout: str, title: str, body: str, right: str,
 @tool
 def add_slide(file_id: str, layout: Layout = "TITLE_AND_BODY", title: str = "", body: str = "",
               right: str = "", notes: str = "", index: int | None = None,
-              bullets: bool = True) -> dict:
+              bullets: bool = True, sources: list[str] | None = None) -> dict:
     """Add a slide to a Google Slides presentation (at the end, or at 0-based `index`).
     `body` fills the main text box (the subtitle on TITLE / SECTION_HEADER layouts);
     `right` fills the second column of TITLE_AND_TWO_COLUMNS. In any text, **x** is
     bold. With bullets=True, body/right lines become bullets and leading tabs nest
     them. `notes` sets the speaker notes. Layouts come from the deck's theme.
-    To leave room for a figure the user will insert by hand, use TITLE_ONLY."""
+    To leave room for a figure the user will insert by hand, use TITLE_ONLY.
+    `sources` (URLs) become a small clickable footer, e.g. "Wikipedia: A · B"."""
     slide = f"s_{uuid.uuid4().hex}"
     create = {"objectId": slide, "slideLayoutReference": {"predefinedLayout": layout}}
     if index is not None:
@@ -389,6 +438,8 @@ def add_slide(file_id: str, layout: Layout = "TITLE_AND_BODY", title: str = "", 
     slides_batch(file_id, [{"createSlide": create}])
     try:
         reqs = fill_requests(get_page(file_id, slide), layout, title, body, right, notes, bullets)
+        if sources:
+            reqs += footer_requests(slide, sources, *page_size_pt(file_id))
         if reqs:
             slides_batch(file_id, reqs)
     except Exception:
@@ -406,6 +457,8 @@ class SlideSpec(BaseModel):
     bullets: bool = True
     image: str | None = Field(None, description="Local file path or Drive file id of a PNG/JPEG/GIF")
     image_region: ImageRegion = "full"
+    sources: list[str] = Field(default_factory=list,
+                               description="Source URLs shown as a small clickable footer")
 
 
 def image_bytes(source: str) -> bytes:
@@ -486,9 +539,12 @@ def create_presentation(name: str, slides: list[SlideSpec], template_id: str | N
         pages = slides_api().get(presentationId=deck["id"],
                                  fields="slides(objectId,pageElements,slideProperties)").execute()["slides"]
         reqs = []
+        Wpt, Hpt = W / EMU_PER_PT, H / EMU_PER_PT
         for spec, page in zip(slides, pages):
             reqs += fill_requests(page, spec.layout, spec.title, spec.body, spec.right,
                                   spec.notes, spec.bullets)
+            if spec.sources:
+                reqs += footer_requests(page["objectId"], spec.sources, Wpt, Hpt)
         if reqs:
             slides_batch(deck["id"], reqs)
     except Exception:
@@ -611,6 +667,8 @@ def style_deck(file_id: str, font: str | None = None, title_font: str | None = N
             is_title = el["shape"].get("placeholder", {}).get("type") in ("TITLE", "CENTERED_TITLE")
             f = (title_font or font) if is_title else font
             c = (title_color or text_color) if is_title else text_color
+            if el["objectId"].startswith(FOOTER_PREFIX):
+                c = None  # source footers keep their small grey style
             style, fields = {}, []
             if f:
                 style["fontFamily"] = f
