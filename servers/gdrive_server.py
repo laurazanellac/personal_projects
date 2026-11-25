@@ -228,6 +228,15 @@ Layout = Literal["TITLE", "SECTION_HEADER", "SECTION_TITLE_AND_DESCRIPTION", "TI
 EMU_PER_PT = 12700
 PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 IMAGE_MIMES = ("image/png", "image/jpeg", "image/gif")
+# Image boxes as fractions of the slide (left, top, width, height). The image is
+# scaled to fit inside its box, keeping its aspect ratio, and centred in it.
+ImageRegion = Literal["full", "left", "right", "slide"]
+IMAGE_REGIONS = {
+    "full": (0.05, 0.22, 0.90, 0.72),   # under a normal title
+    "left": (0.05, 0.22, 0.43, 0.72),   # left column
+    "right": (0.52, 0.22, 0.43, 0.72),  # right column
+    "slide": (0.02, 0.17, 0.96, 0.81),  # as big as possible under a one-line title
+}
 
 
 def slides_api():
@@ -396,7 +405,7 @@ class SlideSpec(BaseModel):
     notes: str = ""
     bullets: bool = True
     image: str | None = Field(None, description="Local file path or Drive file id of a PNG/JPEG/GIF")
-    image_region: Literal["full", "left", "right"] = "full"
+    image_region: ImageRegion = "full"
 
 
 def image_bytes(source: str) -> bytes:
@@ -456,9 +465,7 @@ def create_presentation(name: str, slides: list[SlideSpec], template_id: str | N
         if spec.image:
             data = image_bytes(spec.image)
             px_w, px_h = PILImage.open(io.BytesIO(data)).size
-            x, w = {"full": (0.05 * W, 0.90 * W), "left": (0.05 * W, 0.43 * W),
-                    "right": (0.52 * W, 0.43 * W)}[spec.image_region]
-            y, h = 0.22 * H, 0.72 * H
+            x, y, w, h = (f * d for f, d in zip(IMAGE_REGIONS[spec.image_region], (W, H, W, H)))
             scale = min(w / px_w, h / px_h)  # fit inside the box, centred
             slide.shapes.add_picture(io.BytesIO(data), int(x + (w - px_w * scale) / 2),
                                      int(y + (h - px_h * scale) / 2),
@@ -501,7 +508,7 @@ def set_notes(file_id: str, slide_id: str, notes: str) -> dict:
 
 @tool
 def add_image(file_id: str, slide_id: str, source: str,
-              region: Literal["full", "left", "right"] = "full",
+              region: ImageRegion = "full",
               left: float | None = None, top: float | None = None,
               width: float | None = None, height: float | None = None) -> dict:
     """Place a PNG, JPEG or GIF on a slide. `source` must be an already-public http(s)
@@ -510,10 +517,8 @@ def add_image(file_id: str, slide_id: str, source: str,
     left/right column), or give an explicit box in points (left, top, width, height)."""
     p = slides_api().get(presentationId=file_id, fields="pageSize").execute()["pageSize"]
     W, H = p["width"]["magnitude"] / EMU_PER_PT, p["height"]["magnitude"] / EMU_PER_PT
-    x, w = {"full": (0.05 * W, 0.90 * W), "left": (0.05 * W, 0.43 * W),
-            "right": (0.52 * W, 0.43 * W)}[region]
-    box = [x if left is None else left, 0.22 * H if top is None else top,
-           w if width is None else width, 0.72 * H if height is None else height]
+    default = [f * d for f, d in zip(IMAGE_REGIONS[region], (W, H, W, H))]
+    box = [d if v is None else v for d, v in zip(default, (left, top, width, height))]
 
     # Private images (local files, Drive files) are refused: the Slides API only
     # fetches URLs reachable without login, and we never make the user's files public.
@@ -582,10 +587,14 @@ def format_text(file_id: str, find: str, bold: bool | None = None, italic: bool 
 @tool
 def style_deck(file_id: str, font: str | None = None, title_font: str | None = None,
                text_color: str | None = None, title_color: str | None = None,
-               background: str | None = None) -> dict:
+               background: str | None = None, text_size: float | None = None,
+               nested_text_size: float | None = None) -> dict:
     """Apply a look to every slide that exists now: font family for all text (or
     title_font for titles only), hex colours for body text, titles and the slide
-    background. Run it again after adding slides, then use format_text for one-off
+    background. text_size (pt) sets the size of body text boxes (bullets and
+    columns; titles and subtitles keep theirs), with nested bullet lines at
+    nested_text_size (default: same as text_size). Run it again after adding
+    slides, then use format_text for one-off
     accents (this overrides their colour and font). For a full Google theme, create the
     deck from a themed template instead (create_file with template_id)."""
     slides = slides_api().get(presentationId=file_id,
@@ -614,9 +623,28 @@ def style_deck(file_id: str, font: str | None = None, title_font: str | None = N
                                                  "fields": ",".join(fields), "textRange": {"type": "ALL"}}})
                 if f:
                     reqs += keep_bold(el)
+            if text_size and el["shape"].get("placeholder", {}).get("type") == "BODY":
+                reqs += size_requests(el, text_size, nested_text_size or text_size)
     if reqs:
         slides_batch(file_id, reqs)
     return {"slides": len(slides.get("slides", [])), "changes": len(reqs)}
+
+
+def size_requests(el: dict, top_size: float, nested_size: float) -> list[dict]:
+    """Font-size requests per paragraph: top-level lines at top_size, nested
+    bullet lines (nesting level >= 1) at nested_size."""
+    reqs = []
+    for te in el["shape"].get("text", {}).get("textElements", []):
+        if "paragraphMarker" not in te:
+            continue
+        level = te["paragraphMarker"].get("bullet", {}).get("nestingLevel", 0)
+        start, end = te.get("startIndex", 0), te["endIndex"]
+        if start < end:
+            reqs.append({"updateTextStyle": {
+                "objectId": el["objectId"], "fields": "fontSize",
+                "style": {"fontSize": {"magnitude": nested_size if level else top_size, "unit": "PT"}},
+                "textRange": {"type": "FIXED_RANGE", "startIndex": start, "endIndex": end}}})
+    return reqs
 
 
 @tool
